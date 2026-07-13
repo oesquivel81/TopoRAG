@@ -1,6 +1,6 @@
 # Colab export para TopoRAG
 
-Esta carpeta contiene una clase reutilizable para construir el corpus arXiv y dejarlo consolidado en un solo DataFrame.
+Esta carpeta contiene una clase reutilizable para construir el corpus arXiv, limpiarlo en un flujo condensado y dejarlo listo para usarse en la siguiente etapa del pipeline.
 
 ## Uso en Colab
 
@@ -29,6 +29,13 @@ display(corpus_df.head())
 ```
 
 El resultado final queda disponible en:
-- `result['corpus_df']` para el corpus consolidado
+- `result['corpus_df']` para el corpus limpio y consolidado
 - `result['manifest_df']` para el manifiesto
 - `result['pages_df']` para las páginas crudas
+- `result['cleaning_quality_df']` para el reporte de calidad
+- `result['cleaning_summary']` para el resumen del proceso
+
+Además se exportan automáticamente:
+- `data/processed/arxiv_pages_clean.parquet`
+- `data/processed/arxiv_pages_clean.jsonl`
+- `data/processed/page_quality_report.csv`
