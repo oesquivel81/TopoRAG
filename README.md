@@ -1,1 +1,2 @@
 # TopoRAG
+TopoRAG is a production-oriented Retrieval-Augmented Generation (RAG) system specialized in Topology, Differential Geometry, Algebraic Topology, and related mathematical fields. The project demonstrates modern LLM engineering practices, including embeddings, vector search, hybrid retrieval, reranking, prompt engineering, evaluation, observability, guardrails, fine-tuning, and GPU-accelerated inference.
