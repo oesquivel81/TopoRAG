@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
 import time
+import unicodedata
+from collections import Counter
+from math import ceil
 from pathlib import Path
 from typing import Any, Final, Iterable
 
@@ -28,6 +32,281 @@ DEFAULT_SEARCH_QUERIES: Final[dict[str, str]] = {
         '(all:"persistent homology" OR all:"topological data analysis")'
     ),
 }
+
+
+class CorpusCleaner:
+    """Pipeline condensado de limpieza y validación para el corpus arXiv."""
+
+    def __init__(self, project_root: str | Path | None = None, logger: logging.Logger | None = None) -> None:
+        self.project_root = Path(project_root or "/content/TopoRAG").resolve()
+        self.logger = logger or logging.getLogger("toporag.corpus_cleaning")
+        self.processed_dir = self.project_root / "data" / "processed"
+        self.processed_dir.mkdir(parents=True, exist_ok=True)
+
+        self.cleaned_parquet_path = self.processed_dir / "arxiv_pages_clean.parquet"
+        self.cleaned_jsonl_path = self.processed_dir / "arxiv_pages_clean.jsonl"
+        self.quality_report_path = self.processed_dir / "page_quality_report.csv"
+
+    @staticmethod
+    def clean_mathematical_text(text: str) -> str:
+        if not text:
+            return ""
+
+        text = unicodedata.normalize("NFC", text)
+        text = text.replace("\x00", "")
+        text = "".join(
+            character
+            for character in text
+            if character in "\n\t"
+            or unicodedata.category(character)[0] != "C"
+        )
+        text = re.sub(
+            r"(?<=[A-Za-zÁÉÍÓÚáéíóúñÑ])-\s*\n\s*(?=[a-záéíóúñ])",
+            "",
+            text,
+        )
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r" *\n *", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+        return text.strip()
+
+    @staticmethod
+    def get_non_empty_lines(text: str) -> list[str]:
+        return [line.strip() for line in text.splitlines() if line.strip()]
+
+    @staticmethod
+    def normalize_boundary_line(line: str) -> str:
+        line = line.strip().lower()
+        line = re.sub(r"\s+", " ", line)
+        return line
+
+    @staticmethod
+    def is_standalone_page_number(line: str) -> bool:
+        return bool(
+            re.fullmatch(
+                r"(?:page\s*)?\d{1,4}",
+                line.strip(),
+                flags=re.IGNORECASE,
+            )
+        )
+
+    def detect_repeated_boundaries(
+        self,
+        dataframe: pd.DataFrame,
+        boundary_depth: int = 2,
+        minimum_ratio: float = 0.30,
+    ) -> dict[str, dict[str, Any]]:
+        boundaries_by_article: dict[str, dict[str, Any]] = {}
+
+        for arxiv_id, group in dataframe.groupby("arxiv_id"):
+            header_counter: Counter[str] = Counter()
+            footer_counter: Counter[str] = Counter()
+            page_count = len(group)
+
+            for text in group["basic_clean_text"]:
+                lines = self.get_non_empty_lines(text)
+                if not lines:
+                    continue
+
+                header_lines = lines[:boundary_depth]
+                footer_lines = lines[-boundary_depth:]
+
+                header_counter.update(
+                    self.normalize_boundary_line(line)
+                    for line in header_lines
+                    if len(line.strip()) >= 2
+                )
+                footer_counter.update(
+                    self.normalize_boundary_line(line)
+                    for line in footer_lines
+                    if len(line.strip()) >= 2
+                )
+
+            minimum_repetitions = max(3, ceil(page_count * minimum_ratio))
+            repeated_headers = {
+                line for line, count in header_counter.items() if count >= minimum_repetitions
+            }
+            repeated_footers = {
+                line for line, count in footer_counter.items() if count >= minimum_repetitions
+            }
+            boundaries_by_article[arxiv_id] = {
+                "headers": repeated_headers,
+                "footers": repeated_footers,
+                "minimum_repetitions": minimum_repetitions,
+            }
+
+        return boundaries_by_article
+
+    def remove_repeated_boundaries(
+        self,
+        text: str,
+        arxiv_id: str,
+        boundaries: dict[str, dict[str, Any]],
+        boundary_depth: int = 2,
+    ) -> str:
+        lines = self.get_non_empty_lines(text)
+        if not lines:
+            return ""
+
+        article_boundaries = boundaries.get(
+            arxiv_id,
+            {"headers": set(), "footers": set()},
+        )
+        repeated_headers = article_boundaries["headers"]
+        repeated_footers = article_boundaries["footers"]
+
+        cleaned_lines = lines.copy()
+
+        for _ in range(min(boundary_depth, len(cleaned_lines))):
+            if not cleaned_lines:
+                break
+            first_line = cleaned_lines[0]
+            normalized = self.normalize_boundary_line(first_line)
+            if normalized in repeated_headers or self.is_standalone_page_number(first_line):
+                cleaned_lines.pop(0)
+            else:
+                break
+
+        for _ in range(min(boundary_depth, len(cleaned_lines))):
+            if not cleaned_lines:
+                break
+            last_line = cleaned_lines[-1]
+            normalized = self.normalize_boundary_line(last_line)
+            if normalized in repeated_footers or self.is_standalone_page_number(last_line):
+                cleaned_lines.pop()
+            else:
+                break
+
+        return "\n".join(cleaned_lines).strip()
+
+    @staticmethod
+    def classify_page_quality(text: str) -> str:
+        characters = len(text)
+        words = len(text.split())
+
+        if characters == 0:
+            return "empty"
+        if characters < 100 or words < 15:
+            return "suspicious_short"
+        if characters < 300 or words < 40:
+            return "short"
+        return "usable"
+
+    @staticmethod
+    def create_content_hash(text: str) -> str:
+        if not text:
+            return ""
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def clean_corpus(
+        self,
+        corpus_df: pd.DataFrame,
+        export_outputs: bool = True,
+    ) -> dict[str, Any]:
+        if corpus_df.empty:
+            raise ValueError("No se puede limpiar un corpus vacío")
+
+        self.logger.info("Starting corpus cleaning for %d pages", len(corpus_df))
+
+        working_df = corpus_df.copy()
+        working_df["raw_text"] = working_df["page_content"].fillna("").astype(str)
+        working_df["basic_clean_text"] = working_df["raw_text"].apply(self.clean_mathematical_text)
+        working_df["basic_clean_char_count"] = working_df["basic_clean_text"].str.len()
+        working_df["basic_clean_word_count"] = working_df["basic_clean_text"].str.split().str.len()
+
+        boundaries_by_article = self.detect_repeated_boundaries(working_df)
+        working_df["clean_text"] = working_df.apply(
+            lambda row: self.remove_repeated_boundaries(
+                text=row["basic_clean_text"],
+                arxiv_id=row["arxiv_id"],
+                boundaries=boundaries_by_article,
+                boundary_depth=2,
+            ),
+            axis=1,
+        )
+        working_df["clean_char_count"] = working_df["clean_text"].str.len()
+        working_df["clean_word_count"] = working_df["clean_text"].str.split().str.len()
+        working_df["removed_characters"] = working_df["char_count"] - working_df["clean_char_count"]
+        working_df["removed_percentage"] = (
+            working_df["removed_characters"]
+            .div(working_df["char_count"].replace(0, 1))
+            .mul(100)
+            .round(2)
+        )
+        working_df["quality"] = working_df["clean_text"].apply(self.classify_page_quality)
+        working_df["content_hash"] = working_df["clean_text"].apply(self.create_content_hash)
+        duplicate_mask = (
+            working_df["content_hash"].ne("")
+            & working_df.duplicated(subset=["content_hash"], keep="first")
+        )
+        working_df["is_exact_duplicate"] = duplicate_mask
+
+        clean_corpus_df = (
+            working_df[
+                (working_df["quality"] != "empty") & (~working_df["is_exact_duplicate"])
+            ]
+            .copy()
+            .reset_index(drop=True)
+        )
+        clean_corpus_df["raw_page_content"] = clean_corpus_df["page_content"]
+        clean_corpus_df["page_content"] = clean_corpus_df["clean_text"]
+
+        quality_report_df = working_df[
+            [
+                "arxiv_id",
+                "title",
+                "source_file",
+                "page_number",
+                "total_pages",
+                "char_count",
+                "word_count",
+                "basic_clean_char_count",
+                "basic_clean_word_count",
+                "clean_char_count",
+                "clean_word_count",
+                "removed_percentage",
+                "quality",
+                "is_exact_duplicate",
+                "content_hash",
+            ]
+        ].copy()
+
+        summary = {
+            "rows_pages": len(corpus_df),
+            "rows_clean_pages": len(clean_corpus_df),
+            "unique_articles": clean_corpus_df["arxiv_id"].nunique(),
+            "unique_pdf_files": clean_corpus_df["source_file"].nunique(),
+            "empty_pages": int(clean_corpus_df["quality"].eq("empty").sum()),
+            "duplicate_pages": int(working_df["is_exact_duplicate"].sum()),
+            "total_characters": int(clean_corpus_df["clean_char_count"].sum()),
+            "total_words": int(clean_corpus_df["clean_word_count"].sum()),
+        }
+
+        if export_outputs:
+            self._export_outputs(clean_corpus_df, quality_report_df)
+
+        return {
+            "clean_corpus_df": clean_corpus_df,
+            "working_df": working_df,
+            "quality_report_df": quality_report_df,
+            "summary": summary,
+        }
+
+    def _export_outputs(self, clean_corpus_df: pd.DataFrame, quality_report_df: pd.DataFrame) -> None:
+        self.processed_dir.mkdir(parents=True, exist_ok=True)
+        clean_corpus_df.to_parquet(self.cleaned_parquet_path, index=False, engine="pyarrow", compression="snappy")
+        clean_corpus_df.to_json(
+            self.cleaned_jsonl_path,
+            orient="records",
+            lines=True,
+            force_ascii=False,
+            date_format="iso",
+        )
+        quality_report_df.to_csv(self.quality_report_path, index=False, encoding="utf-8")
+        self.logger.info("Clean parquet: %s", self.cleaned_parquet_path)
+        self.logger.info("Clean JSONL: %s", self.cleaned_jsonl_path)
+        self.logger.info("Quality report: %s", self.quality_report_path)
 
 
 class ArxivCorpusCollector:
@@ -55,6 +334,7 @@ class ArxivCorpusCollector:
         self.logger = self._configure_logger()
         self._prepare_directories()
 
+        self.cleaner = CorpusCleaner(project_root=self.project_root, logger=self.logger)
         self.client = arxiv.Client(
             page_size=10,
             delay_seconds=3,
@@ -65,7 +345,11 @@ class ArxivCorpusCollector:
         self.query_errors_df: pd.DataFrame | None = None
         self.manifest_df: pd.DataFrame | None = None
         self.pages_df: pd.DataFrame | None = None
+        self.raw_corpus_df: pd.DataFrame | None = None
         self.corpus_df: pd.DataFrame | None = None
+        self.cleaned_corpus_df: pd.DataFrame | None = None
+        self.cleaning_quality_df: pd.DataFrame | None = None
+        self.cleaning_summary: dict[str, Any] | None = None
         self.validation_df: pd.DataFrame | None = None
 
     @staticmethod
@@ -585,13 +869,19 @@ class ArxivCorpusCollector:
         if pages_df.empty:
             raise RuntimeError("No pages were extracted")
 
-        corpus_df = pages_df.merge(manifest_df, on="arxiv_id", how="left", validate="many_to_one")
+        raw_corpus_df = pages_df.merge(manifest_df, on="arxiv_id", how="left", validate="many_to_one")
+        cleaning_result = self.cleaner.clean_corpus(raw_corpus_df, export_outputs=True)
+
         self.manifest_df = manifest_df
         self.pages_df = pages_df
-        self.corpus_df = corpus_df
+        self.raw_corpus_df = raw_corpus_df
+        self.cleaned_corpus_df = cleaning_result["clean_corpus_df"]
+        self.corpus_df = self.cleaned_corpus_df
+        self.cleaning_quality_df = cleaning_result["quality_report_df"]
+        self.cleaning_summary = cleaning_result["summary"]
 
-        self.validation_df = self.validate_collection_outputs(manifest_df, pages_df, corpus_df)
-        self._export_final_artifacts(manifest_df, corpus_df)
+        self.validation_df = self.validate_collection_outputs(manifest_df, pages_df, self.corpus_df)
+        self._export_final_artifacts(manifest_df, pages_df, self.corpus_df)
 
         self.query_hits_df = query_hits_df
         self.query_errors_df = query_errors_df
@@ -600,13 +890,17 @@ class ArxivCorpusCollector:
             "query_errors_df": query_errors_df,
             "manifest_df": manifest_df,
             "pages_df": pages_df,
-            "corpus_df": corpus_df,
+            "raw_corpus_df": raw_corpus_df,
+            "corpus_df": self.corpus_df,
+            "cleaned_corpus_df": self.cleaned_corpus_df,
+            "cleaning_quality_df": self.cleaning_quality_df,
+            "cleaning_summary": self.cleaning_summary,
             "validation_df": self.validation_df,
         }
 
-    def _export_final_artifacts(self, manifest_df: pd.DataFrame, corpus_df: pd.DataFrame) -> None:
+    def _export_final_artifacts(self, manifest_df: pd.DataFrame, pages_df: pd.DataFrame, corpus_df: pd.DataFrame) -> None:
         self.export_manifest(manifest_df)
-        corpus_df.to_parquet(
+        pages_df.to_parquet(
             self.raw_pages_parquet_path,
             index=False,
             engine="pyarrow",
